@@ -41,13 +41,12 @@ class OSN():
         self.yoff = valmap(np.sin(angle), -1, 1, self.y, self.y + self.d)
         return self.tmp.noise2(self.xoff,self.yoff)
 
-def circularloop(nf, d, seed, seeds):
+def circularloop(nf, d, seed, seeds, z_coords):
     r = d/2
 
     zs = []
     # hardcoding in 512, prob TODO fix needed
     # latents_c = rnd.randn(1, G.input_shape[1])
-
     if(seeds is None):
         if seed:
             rnd = np.random.RandomState(seed)
@@ -56,6 +55,14 @@ def circularloop(nf, d, seed, seeds):
         latents_a = rnd.randn(1, 512)
         latents_b = rnd.randn(1, 512)
         latents_c = rnd.randn(1, 512)
+
+        if z_coords:
+          print("ZCOORDS being used: "+z_coords)
+          z = np.load(z_coords)["w"]
+          latents_a = z
+          latents_b = latents_b - z
+          latents_c = latents_c - z
+
     elif(len(seeds) is not 3):
         assert('Must choose exactly 3 seeds!')
     else:
@@ -81,8 +88,9 @@ def circular_interpolation(radius, latents_persistent, latents_interpolate):
 
     latents_x = np.sin(np.pi * 2.0 * latents_interpolate) * radius
     latents_y = np.cos(np.pi * 2.0 * latents_interpolate) * radius
+    latents_y = latents_y - radius #inserted for the npz/z_coords files loop
 
-    latents = latents_a + latents_x * latents_axis_x + latents_y * latents_axis_y
+    latents = latents_a + (latents_x * latents_axis_x) + (latents_y * latents_axis_y)
     return latents
 
 def num_range(s: str) -> List[int]:
@@ -163,6 +171,7 @@ def images(G,device,inputs,space,truncation_psi,label,noise_mode,outdir,start=No
         
         if (space=='z'):
             z = torch.from_numpy(i).to(device)
+            # z = i.to(device)
             if(start is not None and stop is not None):
                 img = G(z, label, truncation_psi=tp, noise_mode=noise_mode)
                 tp = tp+tp_i
@@ -175,7 +184,7 @@ def images(G,device,inputs,space,truncation_psi,label,noise_mode,outdir,start=No
         img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/frame{idx:04d}.png')
 
-def interpolate(G,device,projected_w,seeds,random_seed,space,truncation_psi,label,frames,noise_mode,outdir,interpolation,easing,diameter,start=None,stop=None):
+def interpolate(G,device,projected_w,seeds,random_seed,space,truncation_psi,label,frames,noise_mode,outdir,interpolation,easing,diameter,start=None,stop=None,z_coords=None):
     if(interpolation=='noiseloop' or interpolation=='circularloop'):
         if seeds is not None:
             print(f'Warning: interpolation type: "{interpolation}" doesn’t support set seeds.')
@@ -183,7 +192,7 @@ def interpolate(G,device,projected_w,seeds,random_seed,space,truncation_psi,labe
         if(interpolation=='noiseloop'):
             points = noiseloop(frames, diameter, random_seed)
         elif(interpolation=='circularloop'):
-            points = circularloop(frames, diameter, random_seed, seeds)
+            points = circularloop(frames, diameter, random_seed, seeds, z_coords)
 
     else:
         if projected_w is not None:
@@ -213,6 +222,9 @@ def seeds_to_zs(G,seeds):
 
 # slightly modified version of
 # https://github.com/PDillis/stylegan2-fun/blob/master/run_generator.py#L399
+def lerp(t, v0, v1):
+    v2 = (1.0 - t) * v0 + t * v1
+    return v2
 def slerp(t, v0, v1, DOT_THRESHOLD=0.9995):
     '''
     Spherical linear interpolation
@@ -226,7 +238,7 @@ def slerp(t, v0, v1, DOT_THRESHOLD=0.9995):
         v2 (np.ndarray): Interpolation vector between v0 and v1
     '''
     v0 = v0.cpu().detach().numpy()
-    v1 = v1.cpu().detach().numpy()
+    v1 = v1.cpu().detach().numpy()  
     # Copy the vectors to reuse them later
     v0_copy = np.copy(v0)
     v1_copy = np.copy(v1)
@@ -317,6 +329,7 @@ def zs_to_ws(G,device,label,truncation_psi,zs):
 @click.option('--start', type=float, help='starting truncation value', default=0.0, show_default=True)
 @click.option('--stop', type=float, help='stopping truncation value', default=1.0, show_default=True)
 @click.option('--trunc', 'truncation_psi', type=float, help='Truncation psi', default=1, show_default=True)
+@click.option('--z_coords', help='Z space coordinates', type=str, metavar='FILE', )
 
 def generate_images(
     ctx: click.Context,
@@ -340,6 +353,7 @@ def generate_images(
     projected_w: Optional[str],
     start: Optional[float],
     stop: Optional[float],
+    z_coords: Optional[str]
 ):
     """Generate images using pretrained network pickle.
 
@@ -435,16 +449,27 @@ def generate_images(
 
 
     if(process=='image'):
-        if seeds is None:
+        if seeds is None and z_coords is None:
             ctx.fail('--seeds option is required when not using --projected-w')
 
-        # Generate images.
-        for seed_idx, seed in enumerate(seeds):
-            print('Generating image for seed %d (%d/%d) ...' % (seed, seed_idx, len(seeds)))
-            z = torch.from_numpy(np.random.RandomState(seed).randn(1, G.z_dim)).to(device)
-            img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
-            img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
-            PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
+        if(z_coords is not None): #load from prev vector
+          z_loaded = np.load(z_coords)['w']
+          z = torch.tensor(z_loaded, device=device)
+          img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
+          img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+          PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/from_vector.png')
+
+        else: #make vector from seed
+          # Generate images.
+          for seed_idx, seed in enumerate(seeds):
+              z_seed = np.random.RandomState(seed).randn(1, G.z_dim)
+              z = torch.from_numpy(z_seed).to(device)
+              print('Generating image for seed %d (%d/%d) ...' % (seed, seed_idx, len(seeds)))
+              img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
+              img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+              PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
+
+
 
     elif(process=='interpolation' or process=='interpolation-truncation'):
         # create path for frames
@@ -461,7 +486,7 @@ def generate_images(
         if process=='interpolation-truncation':
             interpolate(G,device,projected_w,seeds,random_seed,space,truncation_psi,label,frames,noise_mode,dirpath,interpolation,easing,diameter,start,stop)
         else:
-            interpolate(G,device,projected_w,seeds,random_seed,space,truncation_psi,label,frames,noise_mode,dirpath,interpolation,easing,diameter)
+            interpolate(G,device,projected_w,seeds,random_seed,space,truncation_psi,label,frames,noise_mode,dirpath,interpolation,easing,diameter,z_coords=z_coords)
 
         # convert to video
         cmd=f'ffmpeg -y -r {fps} -i {dirpath}/frame%04d.png -vcodec libx264 -pix_fmt yuv420p {outdir}/{vidname}.mp4'
